@@ -1,31 +1,45 @@
 #!/usr/bin/env node
-// pronoun-sweep.mjs — rewrites he/him/his to they/them/their, and refuses to guess.
+// pronoun-sweep.mjs — rewrites one set of pronouns to another, and refuses to guess.
 //
 // WHY IT IS SHAPED THIS WAY. A blind find-and-replace on pronouns is the easiest way there is to
-// damage a document: it rewrites the inside of quotations, it mangles code, it turns "he lets it
-// go" into nonsense, and it changes sentences that were about somebody else entirely. So this tool
-// is built the other way round — it makes only the changes it can defend, and it hands every
-// ambiguous line to a person.
+// damage a document: it rewrites the inside of quotations, it mangles code, it changes sentences
+// that were about somebody else, and it gets the verb wrong. So this tool is built the other way
+// round — it makes only the changes it can defend, and it hands every ambiguous line to a person.
+//
+// AND IT IS NOT ONE SWAP. he -> they is one person's case, not the tool's. Any set of pronouns can
+// be replaced by any other: she/her to they/them, he/him to she/her, they/them back to he/him, or a
+// set you define yourself (xe/xem/xyr/xyrs/xemself). The tool ships knowing he, she, they and it,
+// because those are the ones most prose uses — and it takes yours.
 //
 // THE RULES
 //   · quoted spans ("..." and “...”) and code spans (`...`) are copied through BYTE-IDENTICAL.
 //     A quote keeps every word it was given.
 //   · metalanguage is never touched: `he/him`, `she/her` — a slash-pair names the pronoun itself.
-//   · a line goes to REVIEW, not AUTO, when it mentions somebody else (--others), carries a
-//     contraction, has an odd number of quote marks, or needs verb agreement (he types -> types).
+//   · the VERB only moves when the two sets need different agreement: he -> they rewrites "he is"
+//     to "they are", he -> she leaves the verb exactly where it was. When the verb must move and
+//     it is a word this tool does not know, the line goes to REVIEW.
+//   · "his" is read in context: "his book" -> "their book", but "the book is his" -> "theirs".
+//   · a line goes to REVIEW, not AUTO, when it mentions somebody else (--others), carries an
+//     ambiguous contraction, has an odd number of quote marks, or needs a verb it cannot supply.
 //   · --verify proves the result: for every changed line the protected spans must be unchanged and
 //     the text must differ only in pronouns and their verbs. Nothing else is allowed to move.
 //
 // USAGE
-//   node pronoun-sweep.mjs [<dir>]                     dry run: counts, reasons, per file
-//   node pronoun-sweep.mjs [<dir>] --sheet out.md      dry run, plus a review sheet to read
-//   node pronoun-sweep.mjs [<dir>] --commit            apply the AUTO lines (backup + receipt)
-//   node pronoun-sweep.mjs --verify <state-dir>        prove a backup against the files it came from
+//   node pronoun-sweep.mjs [<dir>]                       dry run: counts, reasons, per file
+//   node pronoun-sweep.mjs [<dir>] --sheet out.md        dry run, plus a review sheet to read
+//   node pronoun-sweep.mjs [<dir>] --commit              apply the AUTO lines (backup + receipt)
+//   node pronoun-sweep.mjs [<dir>] --verify <state>      prove a backup against the files it came from
+//   node pronoun-sweep.mjs --list-pronouns               the sets it ships with, and how to write one
 //   node pronoun-sweep.mjs --self-test
 //
+//   --from <set>           the pronouns being replaced     (default: he)
+//   --to <set>             the pronouns being written      (default: they)
 //   --others "Name,Name"   names that mean "another person is being discussed" -> REVIEW
 //   --skip "dir,dir"       directories to walk past (default: .git, node_modules, .pronoun-sweep)
 //   --state <dir>          where the backup and receipt go (default: .pronoun-sweep in the cwd)
+//
+//   A set is a name (he, she, they, it) or five forms: subj/obj/poss/possPronouns/reflexive,
+//   with ":plural" when the set takes plural verbs — xe/xem/xyr/xyrs/xemself:plural
 //
 // Dry run by default. Nothing is written until --commit, and --commit writes a backup first.
 
@@ -34,64 +48,96 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 
 const SELF = fileURLToPath(import.meta.url);
 
 // ---------------------------------------------------------------------------------------------
-// The rules
+// The sets it ships with
 // ---------------------------------------------------------------------------------------------
 
-/** Contractions of "he" — these are phrases, because singular-they takes the plural verb. */
-const PHRASES = [
-  [/\bhe's been\b/g, "they've been"], [/\bHe's been\b/g, "They've been"],
-  [/\bhe's got\b/g, "they've got"], [/\bHe's got\b/g, "They've got"],
-  [/\bhe's\b/g, "they're"], [/\bHe's\b/g, "They're"],
-  [/\bhe'd\b/g, "they'd"], [/\bHe'd\b/g, "They'd"],
-  [/\bhe'll\b/g, "they'll"], [/\bHe'll\b/g, "They'll"],
-  [/\bhe was\b/g, 'they were'], [/\bHe was\b/g, 'They were'],
-  [/\bhe wasn't\b/g, "they weren't"], [/\bHe wasn't\b/g, "They weren't"],
-  [/\bhe is\b/g, 'they are'], [/\bHe is\b/g, 'They are'],
-  [/\bhe isn't\b/g, "they aren't"], [/\bHe isn't\b/g, "They aren't"],
-  [/\bhe has\b/g, 'they have'], [/\bHe has\b/g, 'They have'],
-  [/\bhe hasn't\b/g, "they haven't"], [/\bHe hasn't\b/g, "They haven't"],
-  [/\bhe does\b/g, 'they do'], [/\bHe does\b/g, 'They do'],
-  [/\bhe doesn't\b/g, "they don't"], [/\bHe doesn't\b/g, "They don't"],
-].map(([re, to]) => [new RegExp(re.source.replace(/'/g, "['\u2019]"), re.flags), to]);
+export const SETS = {
+  he: { name: 'he', subj: 'he', obj: 'him', poss: 'his', possPron: 'his', refl: 'himself', plural: false },
+  she: { name: 'she', subj: 'she', obj: 'her', poss: 'her', possPron: 'hers', refl: 'herself', plural: false },
+  they: { name: 'they', subj: 'they', obj: 'them', poss: 'their', possPron: 'theirs', refl: 'themselves', plural: true },
+  it: { name: 'it', subj: 'it', obj: 'it', poss: 'its', possPron: 'its', refl: 'itself', plural: false },
+};
 
-const PAIRS = [
-  [/\bhe\b/g, 'they'], [/\bHe\b/g, 'They'],
-  [/\bhim\b/g, 'them'], [/\bHim\b/g, 'Them'],
-  [/\bhis\b/g, 'their'], [/\bHis\b/g, 'Their'],
-  [/\bhimself\b/g, 'themselves'], [/\bHimself\b/g, 'Themselves'],
-];
-
-const CAND = /\b(he|him|his|himself|He|Him|His|Himself)\b/;
-const HE = /\b(he|him|his|himself|He|Him|His|Himself)\b/g;
-const THEY = /\b(they|them|their|theirs|themselves)\b/gi;
-const CONTRACTION = /\b[Hh]e('s|'d|'ll|\u2019s|\u2019d|\u2019ll)\b/;
-
-/** Words that end in -s but are not verbs needing agreement. */
-const STOP = new Set(['his', 'hers', 'its', 'this', 'these', 'those', 'ours', 'yours', 'theirs',
-  'less', 'yes', 'plus', 'thus', 'else', 'twice', 'once']);
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+const matchCase = (out, saw) => (saw && saw[0] === saw[0].toUpperCase() && saw[0] !== saw[0].toLowerCase() ? cap(out) : out);
 
 /**
- * Verb agreement: singular-they takes the plural verb, so a present-tense lexical verb after "he"
- * ("he types", "he runs") is work for a hand. Auxiliaries are handled as phrases above, so what is
- * left here is exactly the cases this tool refuses to guess at.
+ * A set: a shipped name, or five forms written out — subj/obj/possessive/possessive-pronoun/
+ * reflexive — with an optional ":plural" when the set takes plural verb agreement.
+ * Returns null when the spec cannot be read, so the caller can say so plainly.
  */
-export function agreement(text) {
-  const re = /\b[Hh]e\b/g;
-  let m;
-  while ((m = re.exec(text))) {
-    const tail = text.slice(m.index + m[0].length).split(/\s+/).slice(0, 3).join(' ');
-    for (const tok of tail.split(/\s+/)) {
-      const w = tok.replace(/[^A-Za-z]+$/, '');
-      if (/^[A-Za-z]{4,}s$/.test(w) && !STOP.has(w.toLowerCase())) return true;
-    }
-  }
-  return false;
+export function parseSet(spec) {
+  if (!spec) return null;
+  const [body, ...mods] = String(spec).split(':');
+  const named = SETS[body.trim().toLowerCase()];
+  if (named && mods.length === 0) return named;
+  const parts = body.split('/').map((s) => s.trim()).filter(Boolean);
+  if (parts.length !== 5 || parts.some((p) => /\s/.test(p))) return null;
+  const [subj, obj, poss, possPron, refl] = parts;
+  return { name: `${subj}/${obj}`, subj, obj, poss, possPron, refl, plural: mods.some((m) => /^pl/i.test(m)) };
 }
+
+/** The words a reader would call pronouns — used by --verify to canonicalise a line. */
+const PRONOUN_WORDS = ['he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'herself',
+  'they', 'them', 'their', 'theirs', 'themselves', 'it', 'its', 'itself'];
+
+// ---------------------------------------------------------------------------------------------
+// Building the rules for one pair of sets
+// ---------------------------------------------------------------------------------------------
+
+/** The verbs that move with the pronoun, when the two sets disagree about agreement. */
+const SINGULAR_VERBS = [['is', 'are'], ['was', 'were'], ['has', 'have'], ['does', 'do'],
+  ["isn't", "aren't"], ["wasn't", "weren't"], ["hasn't", "haven't"], ["doesn't", "don't"]];
+
+/**
+ * What has to change, given where we are going. `phrases` run before the bare words, so "he is"
+ * becomes "they are" instead of "they is"; `pairs` are the pronouns themselves.
+ */
+export function buildRules(from, to) {
+  const movesVerb = from.plural !== to.plural;
+  const phrases = [];
+  // "he's been" is unambiguous (HAS + participle), so it is safe either way
+  phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]s been\\b`, 'gi'), `${to.subj}${to.plural ? "'ve" : "'s"} been`]);
+  phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]s got\\b`, 'gi'), `${to.subj}${to.plural ? "'ve" : "'s"} got`]);
+  if (movesVerb) {
+    for (const [a, b] of SINGULAR_VERBS) {
+      const [x, y] = from.plural ? [b, a] : [a, b];   // read it from the source's side
+      phrases.push([new RegExp(`\\b${esc(from.subj)} ${esc(x)}\\b`, 'gi'), `${to.subj} ${y}`]);
+    }
+  } else {
+    // same agreement: the contraction carries over untouched, "he's" -> "she's"
+    phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]s\\b`, 'gi'), `${to.subj}'s`]);
+  }
+  // 'd and 'll are the same word in every set
+  phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]d\\b`, 'gi'), `${to.subj}'d`]);
+  phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]ll\\b`, 'gi'), `${to.subj}'ll`]);
+
+  const seen = new Set();
+  const pairs = [];
+  for (const [kind, a, b] of [['subj', from.subj, to.subj], ['obj', from.obj, to.obj],
+    ['poss', from.poss, to.poss], ['possPron', from.possPron, to.possPron], ['refl', from.refl, to.refl]]) {
+    if (!a || !b || a === b) continue;
+    const key = `${a}>${b}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pairs.push({ kind, re: new RegExp(`\\b${esc(a)}\\b`, 'gi'), to: b });
+  }
+
+  return { from, to, movesVerb, phrases, pairs };
+}
+
+/** The possessive "his" points two ways — at a noun ("his book") or at the thing owned ("theirs"). */
+const PRONOUN_CONTEXT = /^\s*($|[.,;:!?)\]}"'\u201D\u2019\u2014-]|and\b|or\b|but\b)/;
+
+// ---------------------------------------------------------------------------------------------
+// Protected spans and the rewrite
+// ---------------------------------------------------------------------------------------------
 
 /** Protected spans — code (`...`) and double-quoted text — as [start,end) ranges. */
 export function spans(line) {
@@ -108,29 +154,36 @@ export function spans(line) {
   return out;
 }
 
-/** Replace inside one unprotected segment. Phrases first, then the bare pronouns. Never across `/`. */
-export function applyPairs(seg) {
+/** Replace inside one unprotected segment. Phrases first, then the pronouns. Never across `/`. */
+export function applyRules(seg, rules) {
   let n = 0;
-  for (const [re, to] of PHRASES) seg = seg.replace(re, () => { n++; return to; });
-  for (const [re, to] of PAIRS) {
-    seg = seg.replace(re, (m, off, whole) => {
+  for (const [re, to] of rules.phrases) seg = seg.replace(re, (m) => { n++; return matchCase(to, m); });
+  for (const p of rules.pairs) {
+    seg = seg.replace(p.re, (m, off, whole) => {
       const before = whole[off - 1], after = whole[off + m.length];
-      if (before === '/' || after === '/') return m;   // metalanguage: he/him names the pronoun
-      n++; return to;
+      if (before === '/' || after === '/') return m;      // metalanguage: he/him names the pronoun
+      if (p.kind === 'poss' && rules.from.poss === rules.from.possPron) {
+        // "the book is his" is the possessive pronoun; "his book" is the determiner
+        const rest = whole.slice(off + m.length);
+        n++;
+        return matchCase(PRONOUN_CONTEXT.test(rest) ? rules.to.possPron : rules.to.poss, m);
+      }
+      n++;
+      return matchCase(p.to, m);
     });
   }
   return [seg, n];
 }
 
 /** The line rewritten, with every protected span copied through untouched. */
-export function rewrite(line) {
+export function rewrite(line, rules) {
   const cuts = spans(line).sort((a, b) => a[0] - b[0]);
   let outStr = '', i = 0, changed = 0;
   for (const [a, b] of cuts) {
-    const [r, n] = applyPairs(line.slice(i, a));
+    const [r, n] = applyRules(line.slice(i, a), rules);
     outStr += r; changed += n; outStr += line.slice(a, b); i = b;
   }
-  const [r, n] = applyPairs(line.slice(i));
+  const [r, n] = applyRules(line.slice(i), rules);
   outStr += r; changed += n;
   return [outStr, changed];
 }
@@ -143,24 +196,56 @@ export function outside(line) {
   return s + line.slice(i);
 }
 
+/** Words that end in -s but are not verbs needing agreement. */
+const STOP = new Set(['his', 'hers', 'its', 'this', 'these', 'those', 'ours', 'yours', 'theirs',
+  'less', 'yes', 'plus', 'thus', 'else', 'twice', 'once', 'always', 'perhaps', 'across']);
+
 /**
- * One line in, one verdict out. `auto` means every change is defensible; `review` carries the
- * reason. This is the whole policy, in one function, so the self-test can exercise it directly.
+ * Verb agreement, the part no rule can fix: when the sets disagree, a present-tense lexical verb
+ * after the subject ("he types" -> "they types") has to become something this tool cannot invent.
  */
-export function classify(line, { others = [], } = {}) {
-  if (!CAND.test(line)) return null;
-  const [now, n] = rewrite(line);
+export function agreement(text, subject) {
+  const re = new RegExp(`\\b${esc(subject)}\\b`, 'gi');
+  let m;
+  while ((m = re.exec(text))) {
+    const tail = text.slice(m.index + m[0].length).split(/\s+/).slice(0, 3).join(' ');
+    for (const tok of tail.split(/\s+/)) {
+      const w = tok.replace(/[^A-Za-z]+$/, '');
+      if (!w || w.toLowerCase() === subject.toLowerCase()) continue;
+      if (/^[A-Za-z]{3,}s$/.test(w) && !STOP.has(w.toLowerCase())) return true;
+    }
+  }
+  return false;
+}
+
+/** One line in, one verdict out. The whole policy, in one function, so the self-test can call it. */
+export function classify(line, { rules, others = [] }) {
+  if (!rules) return null;
+  const from = rules.from;
+  const sourceWords = [from.subj, from.obj, from.poss, from.possPron, from.refl].filter(Boolean);
+  if (!new RegExp(`\\b(${sourceWords.map(esc).join('|')})\\b`, 'i').test(line)) return null;
+  const [now, n] = rewrite(line, rules);
   if (!n) return null;                                   // nothing outside a quote or code span
-  const foreign = others.length ? new RegExp(`\\b(${others.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`) : null;
-  if (foreign && foreign.test(line)) return { kind: 'review', why: 'names another person', was: line, now };
-  if (CONTRACTION.test(line)) return { kind: 'review', why: 'contraction', was: line, now };
-  if (agreement(outside(line))) return { kind: 'review', why: 'agreement', was: line, now };
-  if ((line.match(/["\u201C\u201D]/g) || []).length % 2 === 1) return { kind: 'review', why: 'odd quotes', was: line, now };
+
+  if (others.length && new RegExp(`\\b(${others.map(esc).join('|')})\\b`).test(line)) {
+    return { kind: 'review', why: 'names another person', was: line, now };
+  }
+  // "'s" is IS or HAS — only safe to carry across when both sets take the same verb
+  if (rules.movesVerb && new RegExp(`\\b${esc(from.subj)}['\u2019]s\\b`, 'i').test(line)
+    && !new RegExp(`\\b${esc(from.subj)}['\u2019]s (been|got)\\b`, 'i').test(line)) {
+    return { kind: 'review', why: 'ambiguous contraction', was: line, now };
+  }
+  if (rules.movesVerb && agreement(outside(line), from.subj)) {
+    return { kind: 'review', why: 'agreement', was: line, now };
+  }
+  if ((line.match(/["\u201C\u201D]/g) || []).length % 2 === 1) {
+    return { kind: 'review', why: 'odd quotes', was: line, now };
+  }
   return { kind: 'auto', was: line, now };
 }
 
 /** A whole document: the lines this tool would change, and the ones it will only report. */
-export function classifyText(text, opts = {}) {
+export function classifyText(text, opts) {
   const lines = String(text).split('\n');
   const auto = [], review = [];
   lines.forEach((line, i) => {
@@ -192,21 +277,33 @@ const applyAll = (lines, edits) => {
   return o.join('\n');
 };
 
+/** Canonical form: every pronoun and every verb that agreement can touch becomes a token. */
+export function canon(s, words = PRONOUN_WORDS) {
+  const all = [...new Set([...PRONOUN_WORDS, ...words])].sort((a, b) => b.length - a.length);
+  return s
+    .replace(/[\u2019]/g, "'")
+    .replace(new RegExp(`\\b(${all.map(esc).join('|')})\\b`, 'gi'), 'PRON')
+    .replace(/\b(doesn't|don't|isn't|aren't|wasn't|weren't|hasn't|haven't)\b/gi, 'AUX')
+    .replace(/\b(is|are|was|were|has|have|does|do)\b/gi, 'AUX')
+    .replace(/'(s|d|ll|re|ve)\b/gi, 'CON')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /**
- * The proof. For every file the backup holds, compare it to the file on disk line by line: the
+ * The proof. For every file in the backup, compare it to the file on disk line by line: the
  * protected spans must be identical, and once pronouns and their verbs are canonicalised the rest
  * of the line must be identical too. A failure is something that changed which is neither.
  */
-export function verify(backupDir, rootDir) {
-  // --verify takes the state directory (which holds the receipts too), or a backup directory
-  // directly. A receipt is not a file to compare, so the newest backup is the thing to walk.
-  let base = backupDir;
-  if (!path.basename(backupDir).startsWith('backup-')) {
-    const cands = fs.readdirSync(backupDir, { withFileTypes: true })
+export function verify(stateDir, rootDir, rules = null) {
+  let base = stateDir;
+  if (!path.basename(stateDir).startsWith('backup-')) {
+    const cands = fs.readdirSync(stateDir, { withFileTypes: true })
       .filter((e) => e.isDirectory() && e.name.startsWith('backup-'))
-      .map((e) => path.join(backupDir, e.name)).sort();
+      .map((e) => path.join(stateDir, e.name)).sort();
     if (cands.length) base = cands[cands.length - 1];
   }
+  const words = rules ? [rules.from, rules.to].flatMap((s) => [s.subj, s.obj, s.poss, s.possPron, s.refl]) : [];
   const files = walk(base, new Set());
   const fails = [];
   let changed = 0;
@@ -221,20 +318,11 @@ export function verify(backupDir, rootDir) {
       if (A[i] === B[i]) continue;
       changed++;
       if (JSON.stringify(spans(A[i])) !== JSON.stringify(spans(B[i]))) { fails.push(`a protected span moved: ${rel} L${i + 1}`); continue; }
-      if (canon(A[i]) !== canon(B[i])) fails.push(`changed more than a pronoun: ${rel} L${i + 1}\n    was: ${A[i].trim().slice(0, 160)}\n    now: ${B[i].trim().slice(0, 160)}`);
+      if (canon(A[i], words) !== canon(B[i], words)) fails.push(`changed more than a pronoun: ${rel} L${i + 1}\n    was: ${A[i].trim().slice(0, 160)}\n    now: ${B[i].trim().slice(0, 160)}`);
     }
   }
   return { files: files.length, changed, fails };
 }
-
-const canon = (s) => s
-  .replace(/[\u2019]/g, "'")
-  .replace(/\b(he|him|his|himself|she|her|hers|they|them|their|theirs|themselves)\b/gi, 'PRON')
-  .replace(/\b(doesn't|don't|isn't|aren't|wasn't|weren't|hasn't|haven't)\b/gi, 'AUX')
-  .replace(/\b(is|are|was|were|has|have|does|do)\b/gi, 'AUX')
-  .replace(/'(s|d|ll|re|ve)\b/gi, 'CON')
-  .replace(/\s+/g, ' ')
-  .trim();
 
 // ---------------------------------------------------------------------------------------------
 // Arguments
@@ -244,11 +332,12 @@ export function parseArgs(argv) {
   const values = new Map();
   const flags = new Set();
   const positional = [];
+  const takesValue = ['others', 'skip', 'state', 'sheet', 'verify', 'from', 'to'];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('-') && a.length > 1) {
       const name = a.replace(/^--?/, '');
-      if (['others', 'skip', 'state', 'sheet', 'verify'].includes(name)) {
+      if (takesValue.includes(name)) {
         const next = argv[i + 1];
         if (!next || next.startsWith('-')) return { error: `--${name} needs a value` };
         values.set(name, next); i++; continue;
@@ -259,6 +348,8 @@ export function parseArgs(argv) {
   }
   return {
     root: positional[0] || '.',
+    from: values.get('from') || 'he',
+    to: values.get('to') || 'they',
     others: (values.get('others') || '').split(',').map((s) => s.trim()).filter(Boolean),
     skip: new Set(['.git', 'node_modules', '.pronoun-sweep', ...(values.get('skip') || '').split(',').map((s) => s.trim()).filter(Boolean)]),
     state: values.get('state') || null,
@@ -267,6 +358,7 @@ export function parseArgs(argv) {
     commit: flags.has('commit'),
     help: flags.has('help') || flags.has('h'),
     version: flags.has('version') || flags.has('v'),
+    list: flags.has('list-pronouns'),
     selfTest: flags.has('self-test'),
   };
 }
@@ -275,32 +367,50 @@ export function parseArgs(argv) {
 // Self-test
 // ---------------------------------------------------------------------------------------------
 
-const CASES = [
-  ['a bare pronoun swaps', 'he walked in', (r) => r.auto[0]?.now === 'they walked in'],
-  ['the capital keeps its case', 'His coat was here', (r) => r.auto[0]?.now === 'Their coat was here'],
-  ['himself becomes themselves', 'he taught himself', (r) => r.auto[0]?.now === 'they taught themselves'],
-  ['he is becomes they are', 'he is late', (r) => r.auto[0]?.now === 'they are late'],
-  ['he was becomes they were', 'He was late', (r) => r.auto[0]?.now === 'They were late'],
-  ['he has becomes they have', "he hasn't called", (r) => r.auto[0]?.now === "they haven't called"],
+const R = (from = 'he', to = 'they') => buildRules(parseSet(from), parseSet(to));
+const runOn = (line, rules, others = []) => classifyText(line, { rules, others });
 
-  // the rule that matters most: a quote keeps every word it was given
+const CASES = [
+  // the default pair, and the verbs that have to move with it
+  ['he -> they: a bare pronoun swaps', 'he walked in', (r) => r.auto[0]?.now === 'they walked in'],
+  ['he -> they: the capital keeps its case', 'His coat was here', (r) => r.auto[0]?.now === 'Their coat was here'],
+  ['he -> they: himself becomes themselves', 'he taught himself', (r) => r.auto[0]?.now === 'they taught themselves'],
+  ['he -> they: he is becomes they are', 'he is late', (r) => r.auto[0]?.now === 'they are late'],
+  ['he -> they: he has becomes they have', "he hasn't called", (r) => r.auto[0]?.now === "they haven't called"],
+  ['he -> they: he has been becomes they have been', "he's been late", (r) => r.auto[0]?.now === "they've been late"],
+
+  // the possessive that points two ways
+  ['his before a noun is the determiner', 'his book is here', (r) => r.auto[0]?.now === 'their book is here'],
+  ['his at the end is the possessive pronoun', 'the book is his', (r) => r.auto[0]?.now === 'the book is theirs'],
+
+  // the pairs that are not ours — this is the point of the change
+  ['he -> she: the pronoun swaps', 'he walked in', (r) => r.auto[0]?.now === 'she walked in', R('he', 'she')],
+  ['he -> she: the verb does not move', 'he is late', (r) => r.auto[0]?.now === 'she is late', R('he', 'she')],
+  ['he -> she: his before a noun becomes her', 'his book', (r) => r.auto[0]?.now === 'her book', R('he', 'she')],
+  ['he -> she: his at the end becomes hers', 'the book is his', (r) => r.auto[0]?.now === 'the book is hers', R('he', 'she')],
+  ['she -> they: the verb moves', 'she is late', (r) => r.auto[0]?.now === 'they are late', R('she', 'they')],
+  ['they -> he: the verb moves back', 'they are late', (r) => r.auto[0]?.now === 'he is late', R('they', 'he')],
+  ['they -> she: their before a noun becomes her', 'their book', (r) => r.auto[0]?.now === 'her book', R('they', 'she')],
+
+  // a set the tool has never heard of
+  ['a custom set is read from five forms', 'xe is late', (r) => r.auto[0]?.now === 'they are late', R('xe/xem/xyr/xyrs/xemself', 'they')],
+  ['a custom plural set moves the verb back to a singular one', 'fae are late', (r) => r.auto[0]?.now === 'he is late', R('fae/faer/faer/faers/faerself:plural', 'he')],
+
+  // the rules that never move
   ['a quoted span is untouched', 'he said "he was tired" and left', (r) => r.auto[0]?.now === 'they said "he was tired" and left'],
   ['a quote alone is not a change', 'she said "he was tired"', (r) => r.auto.length === 0 && r.review.length === 0],
   ['a code span is untouched', 'call `he` here', (r) => r.auto.length === 0],
-
-  // metalanguage names the pronoun; it is not prose
   ['he/him is never rewritten', 'pronouns: he/him', (r) => r.auto.length === 0 && r.review.length === 0],
-
-  // the refusals
-  ['another person on the line goes to review', 'Dana said he would', (r) => r.review[0]?.why === 'names another person', { others: ['Dana'] }],
-  ['a contraction goes to review', "he's late", (r) => r.review[0]?.why === 'contraction'],
+  ['another person on the line goes to review', 'Dana said he would', (r) => r.review[0]?.why === 'names another person', R(), ['Dana']],
+  ['an ambiguous contraction goes to review', "he's late", (r) => r.review[0]?.why === 'ambiguous contraction'],
+  ['the same contraction is safe when the verb matches', "he's late", (r) => r.auto[0]?.now === "she's late", R('he', 'she')],
   ['a present-tense verb goes to review', 'he types quickly', (r) => r.review[0]?.why === 'agreement'],
   ['an odd quote count goes to review', 'he said "hello', (r) => r.review[0]?.why === 'odd quotes'],
 
   // and the proof
   ['the verifier accepts a pure swap', null, () => {
     const before = 'he walked in and sat down';
-    const after = rewrite(before)[0];
+    const after = rewrite(before, R())[0];
     return canon(before) === canon(after) && JSON.stringify(spans(before)) === JSON.stringify(spans(after));
   }],
   ['the verifier rejects a reworded line', null, () => canon('he walked in') !== canon('they walked in slowly')],
@@ -308,28 +418,27 @@ const CASES = [
 
 function selfTest() {
   let failed = 0;
-  for (const [name, line, check, opts] of CASES) {
+  const check = (name, ok, detail = '') => { if (!ok) failed++; console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`); };
+  for (const [name, line, fn, rules, others] of CASES) {
     let ok = false, detail = '';
-    try { ok = Boolean(line === null ? check() : check(classifyText(line, opts))); }
-    catch (e) { detail = e.message; }
-    if (!ok) failed++;
-    console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`);
+    try {
+      if (line === null) ok = Boolean(fn());
+      else ok = Boolean(fn(runOn(line, rules || R(), others || [])));
+    } catch (e) { detail = e.message; }
+    check(name, ok, detail);
   }
-  // the command line is part of the promise
   const run = (args) => spawnSync(process.execPath, [SELF, ...args], { encoding: 'utf8' });
   const help = run(['--help']);
-  const helpOk = help.status === 0 && help.stdout.includes('--commit');
-  if (!helpOk) failed++;
-  console.log(`  ${helpOk ? 'PASS' : 'FAIL'}  --help is an answer, not an error`);
+  check('--help is an answer, not an error', help.status === 0 && help.stdout.includes('--from'));
   const ver = run(['--version']);
-  const verOk = ver.status === 0 && ver.stdout.includes(VERSION);
-  if (!verOk) failed++;
-  console.log(`  ${verOk ? 'PASS' : 'FAIL'}  --version names the version`);
+  check('--version names the version', ver.status === 0 && ver.stdout.includes(VERSION));
+  const list = run(['--list-pronouns']);
+  check('--list-pronouns names the sets it ships with', list.status === 0 && ['himself', 'herself', 'themselves', 'itself'].every((w) => list.stdout.includes(w)));
+  const bad = run(['--from', 'nope']);
+  check('a set it cannot read is a sentence, not a guess', bad.status === 2 && /cannot read/i.test(bad.stderr));
   const missing = run(['--verify', 'a-directory-that-is-not-here']);
-  const missingOk = missing.status === 2 && /no such/i.test(missing.stderr) && !/\n\s+at /.test(missing.stderr);
-  if (!missingOk) failed++;
-  console.log(`  ${missingOk ? 'PASS' : 'FAIL'}  a missing directory is a sentence, not a stack trace`);
-  const total = CASES.length + 3;
+  check('a missing directory is a sentence, not a stack trace', missing.status === 2 && /no such/i.test(missing.stderr) && !/\n\s+at /.test(missing.stderr));
+  const total = CASES.length + 5;
   console.log(`\n  ${total - failed}/${total} passed${failed ? ` — ${failed} FAILED` : ''}`);
   return failed === 0;
 }
@@ -338,21 +447,31 @@ function selfTest() {
 // CLI
 // ---------------------------------------------------------------------------------------------
 
-const USAGE = `pronoun-sweep.mjs v${VERSION} — rewrites he/him/his to they/them/their, and refuses to guess
+const USAGE = `pronoun-sweep.mjs v${VERSION} — rewrites one set of pronouns to another, and refuses to guess
 
   node pronoun-sweep.mjs [<dir>]                   dry run: counts, reasons, per file
   node pronoun-sweep.mjs [<dir>] --sheet out.md    dry run, plus a review sheet to read
   node pronoun-sweep.mjs [<dir>] --commit          apply the AUTO lines (writes a backup first)
-  node pronoun-sweep.mjs --verify <state-dir>      prove a backup against the files it came from
+  node pronoun-sweep.mjs [<dir>] --verify <state>  prove a backup against the files it came from
+  node pronoun-sweep.mjs --list-pronouns           the sets it ships with, and how to write your own
   node pronoun-sweep.mjs --self-test
   node pronoun-sweep.mjs --help | --version
 
+  --from <set>           the pronouns being replaced     (default: he)
+  --to <set>             the pronouns being written      (default: they)
   --others "Name,Name"   a name here means another person is on the line -> REVIEW
   --skip "dir,dir"       directories to walk past
   --state <dir>          where the backup and the receipt go (default: .pronoun-sweep in the cwd)
 
+  A set is he, she, they or it, or five forms written out:
+      subj/obj/possessive/possessive-pronoun/reflexive
+      --to "xe/xem/xyr/xyrs/xemself"                xe takes a singular verb
+      --to "fae/faer/faer/faers/faerself:plural"    :plural when the set takes plural verbs
+
   Quotes and code spans are copied through byte-identical. A line that needs a judgement call is
   reported, never rewritten. Nothing is written until --commit.`;
+
+function fail(msg) { console.error(`pronoun-sweep: ${msg}`); process.exit(2); }
 
 function main(argv) {
   const args = parseArgs(argv);
@@ -360,14 +479,32 @@ function main(argv) {
   if (args.selfTest) { console.log(`pronoun-sweep.mjs v${VERSION} — self-test\n`); process.exit(selfTest() ? 0 : 1); }
   if (args.version) { console.log(`pronoun-sweep.mjs v${VERSION}`); process.exit(0); }
   if (args.help) { console.log(USAGE); process.exit(0); }
+  if (args.list) {
+    console.log('pronoun-sweep — the sets it ships with\n');
+    for (const s of Object.values(SETS)) {
+      console.log(`  ${s.name.padEnd(6)} ${s.subj}/${s.obj}/${s.poss}/${s.possPron}/${s.refl}${s.plural ? '   (plural verb)' : '   (singular verb)'}`);
+    }
+    console.log('\nyour own, as five forms:');
+    console.log('  --from "subj/obj/possessive/possessive-pronoun/reflexive"');
+    console.log('  --to   "xe/xem/xyr/xyrs/xemself"              singular verb');
+    console.log('  --to   "fae/faer/faer/faers/faerself:plural"  plural verb');
+    console.log('\nexamples:');
+    console.log('  --from he --to they      the default');
+    console.log('  --from he --to she       the verb stays where it is');
+    console.log('  --from they --to she     the verb moves back');
+    process.exit(0);
+  }
 
-  const state = path.resolve(args.state || '.pronoun-sweep');
+  const from = parseSet(args.from);
+  const to = parseSet(args.to);
+  if (!from) fail(`cannot read --from "${args.from}" — use he, she, they, it, or five forms: subj/obj/poss/possPron/reflexive`);
+  if (!to) fail(`cannot read --to "${args.to}" — use he, she, they, it, or five forms: subj/obj/poss/possPron/reflexive`);
+  const rules = buildRules(from, to);
 
   if (args.verifyDir) {
     const dir = path.resolve(args.verifyDir);
-    if (!fs.existsSync(dir)) { console.error(`pronoun-sweep: no such directory: ${dir}`); process.exit(2); }
-    const root = path.resolve(args.root);
-    const r = verify(dir, root);
+    if (!fs.existsSync(dir)) fail(`no such directory: ${dir}`);
+    const r = verify(dir, path.resolve(args.root), rules);
     console.log(`verified ${r.files} file(s) · ${r.changed} changed line(s)`);
     console.log(r.fails.length === 0
       ? 'RESULT: clean — every change is a pronoun or its verb; quotes and code untouched.'
@@ -377,27 +514,25 @@ function main(argv) {
   }
 
   const root = path.resolve(args.root);
-  if (!fs.existsSync(root)) { console.error(`pronoun-sweep: no such directory: ${root}`); process.exit(2); }
+  if (!fs.existsSync(root)) fail(`no such directory: ${root}`);
 
   const files = walk(root, args.skip);
-  const results = files.map((f) => ({ file: f, ...classifyText(fs.readFileSync(f, 'utf8'), { others: args.others }) }))
+  const results = files.map((f) => ({ file: f, ...classifyText(fs.readFileSync(f, 'utf8'), { rules, others: args.others }) }))
     .filter((r) => r.auto.length || r.review.length);
 
-  let auto = 0, review = 0, he = 0, they = 0;
-  for (const r of results) {
-    auto += r.auto.length; review += r.review.length;
-    for (const line of r.lines) { he += (line.match(HE) || []).length; they += (line.match(THEY) || []).length; }
-  }
+  let auto = 0, review = 0;
+  for (const r of results) { auto += r.auto.length; review += r.review.length; }
 
   console.log(`pronoun-sweep v${VERSION} — ${args.commit ? 'COMMIT' : 'dry run'}\n`);
   console.log(`root            : ${path.relative(process.cwd(), root) || '.'}`);
+  console.log(`pronouns        : ${from.subj}/${from.obj} -> ${to.subj}/${to.obj}${rules.movesVerb ? '   (the verb moves)' : '   (the verb stays)'}`);
   console.log(`files with work : ${results.length}`);
   console.log(`lines AUTO      : ${auto}`);
   console.log(`lines REVIEW    : ${review}`);
   const reasons = {};
   for (const r of results) for (const e of r.review) reasons[e.why] = (reasons[e.why] || 0) + 1;
   if (review) console.log(`  review reasons : ${Object.entries(reasons).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(' · ')}`);
-  console.log(`he : they now   : ${he} / ${they} = ${they ? (he / they).toFixed(2) : 'INF'}:1\n`);
+  console.log('');
 
   results.sort((a, b) => (b.auto.length + b.review.length) - (a.auto.length + a.review.length));
   if (results.length) {
@@ -409,6 +544,7 @@ function main(argv) {
 
   if (args.sheet) {
     const L = [`# pronoun-sweep — review sheet (${new Date().toISOString().slice(0, 16).replace('T', ' ')})`, '',
+      `${from.subj}/${from.obj} -> ${to.subj}/${to.obj}${rules.movesVerb ? ' (the verb moves)' : ''}`, '',
       `AUTO **${auto}** lines · REVIEW **${review}** lines`];
     for (const r of results) {
       L.push('', `## ${path.relative(root, r.file) || r.file}  —  ${r.auto.length} auto · ${r.review.length} review`, '');
@@ -420,6 +556,7 @@ function main(argv) {
   }
 
   if (args.commit) {
+    const state = path.resolve(args.state || '.pronoun-sweep');
     const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '') + '-' + Date.now().toString(36);
     const backup = path.join(state, `backup-${stamp}`);
     const rows = [];
@@ -431,17 +568,18 @@ function main(argv) {
       fs.copyFileSync(r.file, dest);
       const after = applyAll(r.lines, r.auto);
       fs.writeFileSync(r.file, after, 'utf8');
-      rows.push({ rel, lines: r.auto.length, heBefore: (r.lines.join('\n').match(HE) || []).length, heAfter: (after.match(HE) || []).length, theyBefore: (r.lines.join('\n').match(THEY) || []).length, theyAfter: (after.match(THEY) || []).length });
+      rows.push({ rel, lines: r.auto.length });
     }
     const receipt = path.join(state, `receipt-${stamp}.md`);
     fs.mkdirSync(state, { recursive: true });
-    const L = [`# pronoun-sweep — receipt (${new Date().toISOString()})`, '', `backup: \`${backup}\``, '',
-      '| file | lines | he | they |', '| --- | --- | --- | --- |'];
-    for (const r of rows) L.push(`| ${r.rel} | ${r.lines} | ${r.heBefore} → ${r.heAfter} | ${r.theyBefore} → ${r.theyAfter} |`);
+    const L = [`# pronoun-sweep — receipt (${new Date().toISOString()})`, '',
+      `pronouns: ${from.subj}/${from.obj} -> ${to.subj}/${to.obj}`, '', `backup: \`${backup}\``, '',
+      '| file | lines changed |', '| --- | --- |'];
+    for (const r of rows) L.push(`| ${r.rel} | ${r.lines} |`);
     fs.writeFileSync(receipt, L.join('\n'), 'utf8');
     console.log(`\ncommitted ${rows.length} file(s)\nbackup  -> ${backup}\nreceipt -> ${receipt}`);
-    console.log(`\nnext: prove it — node pronoun-sweep.mjs ${path.relative(process.cwd(), root) || '.'} --verify ${path.relative(process.cwd(), state) || state}`);
     if (!rows.length) console.log('(nothing to commit — no AUTO lines)');
+    else console.log(`\nnext: prove it — node pronoun-sweep.mjs "${path.relative(process.cwd(), root) || '.'}" --verify "${path.relative(process.cwd(), state) || state}" --from "${from.name}" --to "${to.name}"`);
   }
 }
 

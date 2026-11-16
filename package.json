@@ -1,7 +1,7 @@
 {
   "name": "pronoun-sweep",
   "version": "1.0.0",
-  "description": "Rewrites he/him/his to they/them/their, and refuses to guess: quotes and code are copied through byte-identical, and anything that needs a judgement call is reported instead of rewritten.",
+  "description": "Rewrites one set of pronouns to another — he/him to they/them or she/her, or five forms you write yourself — and refuses to guess: quotes and code are copied through byte-identical, and ambiguous lines are reported, never rewritten.",
   "type": "module",
   "bin": {
     "pronoun-sweep": "pronoun-sweep.mjs"

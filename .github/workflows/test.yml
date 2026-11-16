@@ -21,16 +21,35 @@ jobs:
       - name: dry run
         run: node pronoun-sweep.mjs examples --others "Dana"
 
-      # 3. the whole cycle on a copy: commit, then prove the commit
-      - name: commit and verify
+      # 3. the whole cycle, on a copy: commit, then prove the commit
+      - name: commit and verify (he -> they)
         run: |
           mkdir -p "$RUNNER_TEMP/work"
           cp examples/draft.md "$RUNNER_TEMP/work/"
           node pronoun-sweep.mjs "$RUNNER_TEMP/work" --others "Dana" --commit --state "$RUNNER_TEMP/state"
           node pronoun-sweep.mjs "$RUNNER_TEMP/work" --verify "$RUNNER_TEMP/state"
-
-      # 4. the two things the whole design is for, checked on the result
       - name: the quote kept every word it was given
         run: grep -q 'said "he is the most careful reviewer we have"' "$RUNNER_TEMP/work/draft.md"
-      - name: the prose changed
-        run: grep -q 'They joined the team' "$RUNNER_TEMP/work/draft.md"
+      - name: the prose changed, and the verb moved with it
+        run: |
+          grep -q 'They joined the team' "$RUNNER_TEMP/work/draft.md"
+          grep -q 'They are usually the first in the room' "$RUNNER_TEMP/work/draft.md"
+
+      # 4. a pair that is not ours, where the verb must NOT move
+      - name: he -> she keeps the verb where it is
+        run: |
+          mkdir -p "$RUNNER_TEMP/she"
+          cp examples/draft.md "$RUNNER_TEMP/she/"
+          node pronoun-sweep.mjs "$RUNNER_TEMP/she" --from he --to she --others "Dana" --commit --state "$RUNNER_TEMP/she-state"
+          node pronoun-sweep.mjs "$RUNNER_TEMP/she" --verify "$RUNNER_TEMP/she-state" --from he --to she
+          grep -q 'She joined the team' "$RUNNER_TEMP/she/draft.md"
+          grep -q 'she brought two notebooks' "$RUNNER_TEMP/she/draft.md"
+          grep -q 'She is usually the first in the room' "$RUNNER_TEMP/she/draft.md"
+
+      # 5. a set the tool has never heard of
+      - name: a custom set is read from five forms
+        run: |
+          mkdir -p "$RUNNER_TEMP/xe"
+          cp examples/draft.md "$RUNNER_TEMP/xe/"
+          node pronoun-sweep.mjs "$RUNNER_TEMP/xe" --from he --to "xe/xem/xyr/xyrs/xemself" --commit --state "$RUNNER_TEMP/xe-state"
+          grep -q 'Xe joined the team' "$RUNNER_TEMP/xe/draft.md"
