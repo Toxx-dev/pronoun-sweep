@@ -1,0 +1,36 @@
+name: self-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 1. the tool proves itself before it is trusted with anything
+      - name: self-test
+        run: node pronoun-sweep.mjs --self-test
+
+      # 2. a dry run on the example that ships — and it must write nothing
+      - name: dry run
+        run: node pronoun-sweep.mjs examples --others "Dana"
+
+      # 3. the whole cycle on a copy: commit, then prove the commit
+      - name: commit and verify
+        run: |
+          mkdir -p "$RUNNER_TEMP/work"
+          cp examples/draft.md "$RUNNER_TEMP/work/"
+          node pronoun-sweep.mjs "$RUNNER_TEMP/work" --others "Dana" --commit --state "$RUNNER_TEMP/state"
+          node pronoun-sweep.mjs "$RUNNER_TEMP/work" --verify "$RUNNER_TEMP/state"
+
+      # 4. the two things the whole design is for, checked on the result
+      - name: the quote kept every word it was given
+        run: grep -q 'said "he is the most careful reviewer we have"' "$RUNNER_TEMP/work/draft.md"
+      - name: the prose changed
+        run: grep -q 'They joined the team' "$RUNNER_TEMP/work/draft.md"
