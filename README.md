@@ -9,17 +9,20 @@ node pronoun-sweep.mjs --self-test
 ```
 
 ```text
-pronoun-sweep.mjs v1.1.0 — self-test
+pronoun-sweep.mjs v0.1.0 — self-test
 
   PASS  he -> they: a bare pronoun swaps
-  PASS  he -> they: he is becomes they are
+  PASS  #1: her before a noun is the determiner
+  PASS  #1: it after a verb is the object
+  PASS  an auxiliary before it cannot be read, so it refuses
   PASS  he -> she: the verb does not move
   PASS  they -> he: the verb moves back
   PASS  a custom set is read from five forms
   ...
+  PASS  the proof fails the wrong form, though a pronoun did move
   PASS  --list-pronouns names the sets it ships with
 
-  33/33 passed
+  43/43 passed
 ```
 
 ## The sets it ships with
@@ -55,7 +58,7 @@ node pronoun-sweep.mjs ./notes --from he --to they --others "Dana"
 ```
 
 ```text
-pronoun-sweep v1.1.0 — dry run
+pronoun-sweep v0.1.0 — dry run
 
 root            : notes
 pronouns        : he/him -> they/them   (the verb moves)
@@ -146,28 +149,36 @@ This is the part worth reading, because it is why the tool exists.
 - **An ambiguous contraction goes to REVIEW.** `he's` is *he is* or *he has*, so crossing from a singular set to a plural one is not guessed at. (`he's been` and `he's got` are unambiguous, and those it does.)
 - **A present-tense verb goes to REVIEW** when the verb has to move. `he types` would become `they types`, and the tool will not invent `type` for you. When both sets take the same verb, the line is safe and it takes it.
 - **An odd number of quote marks goes to REVIEW.** If the quoting is unbalanced, the tool cannot know what is inside it.
+- **A pronoun whose role it cannot read goes to REVIEW.** `her` is both the object and the determiner, `it` both the subject and the object. Where the sentence settles which one is in play, the line is rewritten; where it does not, the line is handed over untouched.
 
 A refused line is still shown in the sheet — with its proposed rewrite — so the decision takes seconds instead of a re-read.
 
-## Possessive and possessive pronoun
+## Words that do two jobs
 
-`his` and `its` do two jobs, and the tool reads the sentence to tell them apart:
+`his`, `her` and `it` each carry more than one role, and the tool reads the sentence around the word to tell them apart — not the word alone, because the word alone cannot say:
 
 | | |
 |---|---|
 | `his book` | `their book` — the determiner, in front of the noun |
 | `the book is his` | `theirs` — the possessive pronoun, standing alone |
+| `she lost her book` | `they lost their book` — `her` before a noun is the determiner |
+| `I saw her` | `I saw them` — `her` at the end of a clause is the object |
+| `her yesterday` | `them yesterday` — an adverb cannot begin a noun phrase, so `her` is the object |
+| `the dog dropped it` | `the dog dropped them` — `it` after a verb is the object |
+| `it was cold` | `they were cold` — `it` at the head of a clause is the subject |
 
-With `he → she` the same lines become `her book` and `hers`. Getting this wrong is the difference between a correction and a mistake, so it is checked in the suite.
+With `he → she` the same lines become `her book` and `hers`. Getting this wrong is the difference between a correction and a mistake, so every one of these lines is in the suite.
+
+**Where the sentence cannot settle it, the tool does not pick.** A pronoun after an auxiliary is the case to know about: `I did it` and `does it work` read identically from here, one is an object and the other is inverted, so the line goes to review instead of being guessed at. That is the whole policy — it would rather hand you a line than write a wrong one.
 
 ## The proof
 
 `--verify` is the other half of the promise. For every file in the backup it compares line by line against the file on disk:
 
 1. the protected spans must be **identical**, and
-2. once pronouns and their verbs are canonicalised, **the rest of the line must be identical**.
+2. once pronouns, **the role each one is playing**, and the verbs agreement can touch are canonicalised, **the rest of the line must be identical**.
 
-So a passing verify says, mechanically: *nothing moved except the pronouns and their verbs.* If a run ever changes a word you wrote, the verify fails and names the line. It is the check the author ran against their own work, shipped so you can run it too.
+The role is what makes the proof mean anything. Collapsing every pronoun to one token would let `they lost them book` pass as a clean rewrite of `she lost her book` — a pronoun moved, and the wrong one landed. With the role in the canonical form that line fails and the right one passes. So a passing verify says, mechanically: *nothing moved except the pronouns, their roles and their verbs.* If a run changes a word you wrote, or writes the wrong form where the right word belonged, the verify fails and names the line. It is the check the author ran against their own work, shipped so you can run it too.
 
 ## What it does not do
 
@@ -221,6 +232,14 @@ node pronoun-sweep.mjs ./notes --from he --to "xe/xem/xyr/xyrs/xemself"
 따옴표 안의 문장, 코드 블록, `인라인 코드` 는 한 글자도 건드리지 않습니다. 판단이 필요한 줄은 보고만 합니다: 다른 사람의 이름(`--others`), 모호한 축약형, 동사 일치가 필요한 줄, 따옴표 개수가 맞지 않는 줄. **동사가 움직이는 것은 두 세트의 일치 규칙이 다를 때뿐**입니다. `he → they` 는 `he is` 를 바꾸고, `he → she` 는 바꾸지 않습니다. `--verify` 는 대명사와 그 동사 말고 아무것도 움직이지 않았음을 줄마다 증명합니다.
 
 자세한 규칙은 위의 영어 절에 있습니다.
+
+## Credits
+
+**The role bug is Carrious's.** In [issue #1](https://github.com/Toxx-dev/pronoun-sweep/issues/1) they reported that `she → they` turned `she lost her book` into `they lost them book`, and that `it → they` turned `the dog dropped it` into `the dog dropped they` — and that `--verify` certified both as clean.
+
+The report came with the diagnosis and the shape of the fix: that the rules ran in a fixed order so one form swallowed the other, that the context check saving `his` only fired for a set that reuses one word as both possessive forms, and that the proof collapsed every pronoun to a single token and so could never see which form had landed. It then suggested the two things this version does — disambiguate by context, and carry the grammatical slot into the canonical form so the proof can fail.
+
+The role classifier, the one-pass rewrite and the role-bearing canonical form all come from that report. Written up by Keel (Claude) at Carrious's request.
 
 ## License
 

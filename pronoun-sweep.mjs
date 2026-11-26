@@ -48,7 +48,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '1.1.0';
+export const VERSION = '0.1.0';
 
 const SELF = fileURLToPath(import.meta.url);
 
@@ -110,10 +110,14 @@ export function buildRules(from, to) {
       const [x, y] = from.plural ? [b, a] : [a, b];   // read it from the source's side
       phrases.push([new RegExp(`\\b${esc(from.subj)} ${esc(x)}\\b`, 'gi'), `${to.subj} ${y}`]);
     }
-  } else {
-    // same agreement: the contraction carries over untouched, "he's" -> "she's"
-    phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]s\\b`, 'gi'), `${to.subj}'s`]);
   }
+  // The contractions. "'s" is IS or HAS and "'re" is ARE, so the arriving subject decides the
+  // form — and this has to run before the forms pass, or "it's cold" reads the "it" inside the
+  // contraction and writes "they's cold". ("it's cold" is IS, so the suggestion is "they're";
+  // where "'s" could be HAS the line still goes to review, because only the line can say.)
+  const contracted = to.plural ? "'re" : "'s";
+  phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]re\\b`, 'gi'), `${to.subj}${contracted}`]);
+  phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]s\\b`, 'gi'), `${to.subj}${contracted}`]);
   // 'd and 'll are the same word in every set
   phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]d\\b`, 'gi'), `${to.subj}'d`]);
   phrases.push([new RegExp(`\\b${esc(from.subj)}['\u2019]ll\\b`, 'gi'), `${to.subj}'ll`]);
@@ -129,11 +133,87 @@ export function buildRules(from, to) {
     pairs.push({ kind, re: new RegExp(`\\b${esc(a)}\\b`, 'gi'), to: b });
   }
 
-  return { from, to, movesVerb, phrases, pairs };
+  const forms = [...new Set([from.subj, from.obj, from.poss, from.possPron, from.refl].filter(Boolean))]
+    .sort((a, b) => b.length - a.length);
+  return { from, to, movesVerb, phrases, pairs, forms, formsRe: new RegExp(`\\b(${forms.map(esc).join('|')})\\b`, 'gi') };
 }
 
 /** The possessive "his" points two ways — at a noun ("his book") or at the thing owned ("theirs"). */
 const PRONOUN_CONTEXT = /^\s*($|[.,;:!?)\]}"'\u201D\u2019\u2014-]|and\b|or\b|but\b)/;
+
+// ---------------------------------------------------------------------------------------------
+// The role — the thing this tool used to decide by rule order
+// ---------------------------------------------------------------------------------------------
+//
+// Every form carries a grammatical role: subject, object, possessive determiner, possessive
+// pronoun, or reflexive. When a set uses one word for two roles — "her" is both the object and
+// the determiner; "it" is both the subject and the object — the role has to be read off the
+// sentence, because the word alone cannot say which one it is.
+//
+// That was the bug (Carrious's issue #1, reproduced 2026-11-25): the rules ran subject, then
+// object, then possessive, so "her" was always caught by the object rule — "she lost her book"
+// became "they lost them book" — and "it" was always caught by the subject rule — "the dog
+// dropped it" became "the dog dropped they". The order decided, not the grammar.
+//
+// The two calls below are the whole of it, and both are stated so they can be argued with:
+// a possessive determiner is followed by the noun phrase it belongs to; a subject is at the
+// head of a clause. Where neither test can call it, roleOf returns null and the line goes to
+// review — the tool refuses, which is what it has always claimed to do.
+
+/** Words that cannot begin the noun phrase after a determiner — so "her" before one is the object. */
+const NOT_A_NOUN_START = new Set(['yesterday', 'today', 'tomorrow', 'tonight', 'again', 'too', 'now',
+  'then', 'still', 'already', 'back', 'home', 'there', 'here', 'out', 'up', 'down', 'off', 'away',
+  'in', 'on', 'at', 'for', 'with', 'and', 'or', 'but', 'so', 'as', 'that', 'which', 'who', 'when',
+  'if', 'while', 'because', 'since', 'though', 'although', 'unless', 'until', 'not', 'never',
+  'always', 'just', 'even', 'only', 'also', 'instead', 'anyway', 'later', 'soon', 'once', 'twice',
+  'before', 'after', 'over', 'under', 'around', 'through', 'against', 'about', 'more', 'most',
+  'very', 'well', 'much', 'least', 'else', 'either', 'neither', 'both', 'all', 'any', 'some']);
+
+/** Words that open a clause — a subject can stand right after one. */
+const CLAUSE_STARTERS = new Set(['and', 'or', 'but', 'so', 'then', 'when', 'if', 'while', 'because',
+  'since', 'though', 'although', 'that', 'which', 'who', 'where', 'unless', 'until', 'as', 'than',
+  'yet', 'nor', 'once', 'before', 'after', 'til', 'till', 'whenever', 'wherever', 'whether']);
+
+/** An auxiliary before the pronoun is inversion ("does it work") or a plain object ("I did it") —
+ *  the two read the same from here, so the line goes to review rather than being guessed. */
+const AUXILIARY = new Set(['is', 'are', 'was', 'were', 'do', 'does', 'did', 'can', 'could', 'will',
+  'would', 'shall', 'should', 'may', 'might', 'must', 'has', 'have', 'had']);
+
+/**
+ * What role `word` is playing, given the text either side of it and the set it came from.
+ * Null means the tool cannot say — and a null is never turned into a guess.
+ */
+export function roleOf(word, before, after, set) {
+  const w = String(word).toLowerCase();
+  const cand = ['subj', 'obj', 'poss', 'possPron', 'refl'].filter((k) => set && set[k] && set[k].toLowerCase() === w);
+  if (cand.length === 0) return null;
+  if (cand.length === 1) return cand[0];
+
+  const nextTok = (after.match(/^\s*[^\s]+/) || [''])[0].trim();
+  const next = nextTok.toLowerCase().replace(/[^a-z'-].*$/, '');
+  const prevTok = (before.replace(/\s+$/, '').match(/[^\s]+$/) || [''])[0];
+  const prev = prevTok.toLowerCase().replace(/[^a-z'-].*$/, '');
+
+  // his: a noun phrase after it makes it the determiner; the clause's end makes it the pronoun
+  if (cand.includes('poss') && cand.includes('possPron')) {
+    return PRONOUN_CONTEXT.test(after) ? 'possPron' : 'poss';
+  }
+  // her: "her book" is the determiner, "saw her" and "saw her yesterday" are the object
+  if (cand.includes('poss') && cand.includes('obj')) {
+    if (!next) return 'obj';
+    if (NOT_A_NOUN_START.has(next) || /ly$/.test(next)) return 'obj';
+    return 'poss';
+  }
+  // it: at the head of a clause it is the subject, after a verb or preposition it is the object
+  if (cand.includes('subj') && cand.includes('obj')) {
+    if (!prevTok) return 'subj';
+    if (/[.!?;:,]\s*$/.test(prevTok)) return 'subj';
+    if (AUXILIARY.has(prev)) return null;
+    if (CLAUSE_STARTERS.has(prev)) return 'subj';
+    return 'obj';
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Protected spans and the rewrite
@@ -156,36 +236,36 @@ export function spans(line) {
 
 /** Replace inside one unprotected segment. Phrases first, then the pronouns. Never across `/`. */
 export function applyRules(seg, rules) {
-  let n = 0;
+  let n = 0, unknown = 0;
   for (const [re, to] of rules.phrases) seg = seg.replace(re, (m) => { n++; return matchCase(to, m); });
-  for (const p of rules.pairs) {
-    seg = seg.replace(p.re, (m, off, whole) => {
-      const before = whole[off - 1], after = whole[off + m.length];
-      if (before === '/' || after === '/') return m;      // metalanguage: he/him names the pronoun
-      if (p.kind === 'poss' && rules.from.poss === rules.from.possPron) {
-        // "the book is his" is the possessive pronoun; "his book" is the determiner
-        const rest = whole.slice(off + m.length);
-        n++;
-        return matchCase(PRONOUN_CONTEXT.test(rest) ? rules.to.possPron : rules.to.poss, m);
-      }
-      n++;
-      return matchCase(p.to, m);
-    });
-  }
-  return [seg, n];
+  if (!rules.formsRe) return [seg, n, unknown];
+  // one pass over every source form: the role at that position decides the word, and where the
+  // role cannot be read the word is left alone and counted — never resolved by which rule ran first
+  seg = seg.replace(rules.formsRe, (m, ...rest) => {
+    const off = rest[rest.length - 2], whole = rest[rest.length - 1];
+    const before = whole[off - 1], after = whole[off + m.length];
+    if (before === '/' || after === '/') return m;      // metalanguage: he/him names the pronoun
+    const role = roleOf(m, whole.slice(0, off), whole.slice(off + m.length), rules.from);
+    if (!role) { unknown++; return m; }
+    const out = rules.to[role];
+    if (!out) return m;
+    n++;
+    return matchCase(out, m);
+  });
+  return [seg, n, unknown];
 }
 
 /** The line rewritten, with every protected span copied through untouched. */
 export function rewrite(line, rules) {
   const cuts = spans(line).sort((a, b) => a[0] - b[0]);
-  let outStr = '', i = 0, changed = 0;
+  let outStr = '', i = 0, changed = 0, unknown = 0;
   for (const [a, b] of cuts) {
-    const [r, n] = applyRules(line.slice(i, a), rules);
-    outStr += r; changed += n; outStr += line.slice(a, b); i = b;
+    const [r, n, u] = applyRules(line.slice(i, a), rules);
+    outStr += r; changed += n; unknown += u; outStr += line.slice(a, b); i = b;
   }
-  const [r, n] = applyRules(line.slice(i), rules);
-  outStr += r; changed += n;
-  return [outStr, changed];
+  const [r, n, u] = applyRules(line.slice(i), rules);
+  outStr += r; changed += n; unknown += u;
+  return [outStr, changed, unknown];
 }
 
 /** Everything outside the protected spans — what the agreement check is allowed to read. */
@@ -224,8 +304,11 @@ export function classify(line, { rules, others = [] }) {
   const from = rules.from;
   const sourceWords = [from.subj, from.obj, from.poss, from.possPron, from.refl].filter(Boolean);
   if (!new RegExp(`\\b(${sourceWords.map(esc).join('|')})\\b`, 'i').test(line)) return null;
-  const [now, n] = rewrite(line, rules);
-  if (!n) return null;                                   // nothing outside a quote or code span
+  const [now, n, unknown] = rewrite(line, rules);
+  if (!n && !unknown) return null;                       // nothing outside a quote or code span
+
+  // the one Carrious found: a form that plays two roles and whose role this tool cannot read
+  if (unknown) return { kind: 'review', why: 'a pronoun whose role it cannot place', was: line, now };
 
   if (others.length && new RegExp(`\\b(${others.map(esc).join('|')})\\b`).test(line)) {
     return { kind: 'review', why: 'names another person', was: line, now };
@@ -277,12 +360,26 @@ const applyAll = (lines, edits) => {
   return o.join('\n');
 };
 
-/** Canonical form: every pronoun and every verb that agreement can touch becomes a token. */
-export function canon(s, words = PRONOUN_WORDS) {
-  const all = [...new Set([...PRONOUN_WORDS, ...words])].sort((a, b) => b.length - a.length);
+/**
+ * Canonical form: every pronoun becomes the ROLE it is playing, every verb that agreement can
+ * touch becomes a token. The role is the whole point — collapsing a pronoun to one generic token
+ * is what let the proof certify "they lost them book" as clean, because both lines reduced to the
+ * same thing. A role that cannot be read becomes `PRON_?`, which keeps a line from passing on a
+ * reading nobody could make.
+ */
+export function canon(s, rules = null) {
+  const extra = rules ? [rules.from, rules.to].flatMap((x) => [x.subj, x.obj, x.poss, x.possPron, x.refl]) : [];
+  const all = [...new Set([...PRONOUN_WORDS, ...extra].filter(Boolean))].sort((a, b) => b.length - a.length);
+  const sets = rules ? [rules.from, rules.to, ...Object.values(SETS)] : Object.values(SETS);
   return s
     .replace(/[\u2019]/g, "'")
-    .replace(new RegExp(`\\b(${all.map(esc).join('|')})\\b`, 'gi'), 'PRON')
+    .replace(new RegExp(`\\b(${all.map(esc).join('|')})\\b`, 'gi'), (m, ...rest) => {
+      const off = rest[rest.length - 2], whole = rest[rest.length - 1];
+      const set = sets.find((x) => x && ['subj', 'obj', 'poss', 'possPron', 'refl']
+        .some((k) => x[k] && x[k].toLowerCase() === m.toLowerCase()));
+      const role = set ? roleOf(m, whole.slice(0, off), whole.slice(off + m.length), set) : null;
+      return role ? `PRON_${role.toUpperCase()}` : 'PRON_?';
+    })
     .replace(/\b(doesn't|don't|isn't|aren't|wasn't|weren't|hasn't|haven't)\b/gi, 'AUX')
     .replace(/\b(is|are|was|were|has|have|does|do)\b/gi, 'AUX')
     .replace(/'(s|d|ll|re|ve)\b/gi, 'CON')
@@ -303,7 +400,6 @@ export function verify(stateDir, rootDir, rules = null) {
       .map((e) => path.join(stateDir, e.name)).sort();
     if (cands.length) base = cands[cands.length - 1];
   }
-  const words = rules ? [rules.from, rules.to].flatMap((s) => [s.subj, s.obj, s.poss, s.possPron, s.refl]) : [];
   const files = walk(base, new Set());
   const fails = [];
   let changed = 0;
@@ -318,7 +414,7 @@ export function verify(stateDir, rootDir, rules = null) {
       if (A[i] === B[i]) continue;
       changed++;
       if (JSON.stringify(spans(A[i])) !== JSON.stringify(spans(B[i]))) { fails.push(`a protected span moved: ${rel} L${i + 1}`); continue; }
-      if (canon(A[i], words) !== canon(B[i], words)) fails.push(`changed more than a pronoun: ${rel} L${i + 1}\n    was: ${A[i].trim().slice(0, 160)}\n    now: ${B[i].trim().slice(0, 160)}`);
+      if (canon(A[i], rules) !== canon(B[i], rules)) fails.push(`changed more than a pronoun: ${rel} L${i + 1}\n    was: ${A[i].trim().slice(0, 160)}\n    now: ${B[i].trim().slice(0, 160)}`);
     }
   }
   return { files: files.length, changed, fails };
@@ -383,6 +479,15 @@ const CASES = [
   ['his before a noun is the determiner', 'his book is here', (r) => r.auto[0]?.now === 'their book is here'],
   ['his at the end is the possessive pronoun', 'the book is his', (r) => r.auto[0]?.now === 'the book is theirs'],
 
+  // the role decides, not the order the rules happen to run in — Carrious's issue #1, 2026-11-25
+  ['#1: her before a noun is the determiner', 'she lost her book', (r) => r.auto[0]?.now === 'they lost their book', R('she', 'they')],
+  ['#1: her at a clause end is the object', 'I saw her', (r) => r.auto[0]?.now === 'I saw them', R('she', 'they')],
+  ['her before an adverb is still the object', 'I saw her yesterday', (r) => r.auto[0]?.now === 'I saw them yesterday', R('she', 'they')],
+  ['#1: it after a verb is the object', 'the dog dropped it', (r) => r.auto[0]?.now === 'the dog dropped them', R('it', 'they')],
+  ['it at the head of a clause is the subject', 'it was cold', (r) => r.auto[0]?.now === 'they were cold', R('it', 'they')],
+  ['an auxiliary before it cannot be read, so it refuses', 'I did it', (r) => r.review[0]?.why === 'a pronoun whose role it cannot place', R('it', 'they')],
+  ["a contraction keeps its subject's job", "it's cold", (r) => r.review[0]?.why === 'ambiguous contraction' && r.review[0]?.now === "they're cold", R('it', 'they')],
+
   // the pairs that are not ours — this is the point of the change
   ['he -> she: the pronoun swaps', 'he walked in', (r) => r.auto[0]?.now === 'she walked in', R('he', 'she')],
   ['he -> she: the verb does not move', 'he is late', (r) => r.auto[0]?.now === 'she is late', R('he', 'she')],
@@ -414,6 +519,9 @@ const CASES = [
     return canon(before) === canon(after) && JSON.stringify(spans(before)) === JSON.stringify(spans(after));
   }],
   ['the verifier rejects a reworded line', null, () => canon('he walked in') !== canon('they walked in slowly')],
+  ['the proof passes a correct rewrite', null, () => canon('she lost her book', R('she', 'they')) === canon('they lost their book', R('she', 'they'))],
+  ['the proof fails the wrong form, though a pronoun did move', null, () => canon('she lost her book', R('she', 'they')) !== canon('they lost them book', R('she', 'they'))],
+  ['the proof fails the object where the subject belonged', null, () => canon('the dog dropped it', R('it', 'they')) !== canon('the dog dropped they', R('it', 'they'))],
 ];
 
 function selfTest() {

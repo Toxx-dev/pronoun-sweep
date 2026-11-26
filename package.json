@@ -1,6 +1,6 @@
 {
   "name": "pronoun-sweep",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Rewrites one set of pronouns to another — he/him to they/them or she/her, or five forms you write yourself — and refuses to guess: quotes and code are copied through byte-identical, and ambiguous lines are reported, never rewritten.",
   "type": "module",
   "bin": {
